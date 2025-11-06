@@ -1,0 +1,39 @@
+// EventListenerPublisher.cs
+public class EventListenerPublisher
+{
+    private readonly IRedisClient _redis;
+    private readonly IQueuePublisher _publisher;
+    private readonly IWebSocketClient _webSocket;
+
+    public EventListenerPublisher(IRedisClient redis, IQueuePublisher publisher, IWebSocketClient webSocket)
+    {
+        _redis = redis;
+        _publisher = publisher;
+        _webSocket = webSocket;
+    }
+
+    public async Task StartAsync()
+    {
+        // Subscribe to WebSocket event stream
+        _webSocket.OnMessageReceived += async (eventData) =>
+        {
+            string eventId = eventData.Id;
+
+            // Deduplication check using Redis SETNX
+            bool isNewEvent = await _redis.SetIfNotExistsAsync($"event:{eventId}", "1", TimeSpan.FromMinutes(5));
+
+            if (!isNewEvent)
+            {
+                Console.WriteLine($"Duplicate event detected: {eventId} — skipped publishing.");
+                return;
+            }
+
+            // Publish unique event to message queue
+            await _publisher.PublishAsync("event-queue", eventData);
+            Console.WriteLine($"Event {eventId} published successfully.");
+        };
+
+        await _webSocket.ConnectAsync();
+        Console.WriteLine("Event listener started and awaiting messages...");
+    }
+}

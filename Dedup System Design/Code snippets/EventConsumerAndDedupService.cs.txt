@@ -1,0 +1,97 @@
+using System.Text;
+using System.Text.Json;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+
+public class EventConsumer
+{
+    private readonly IConnection _connection;
+    private readonly IModel _channel;
+    private readonly IDatabase _db;
+    private readonly ILogger<EventConsumer> _logger;
+    private readonly string _queueName = "event_queue";
+
+    public EventConsumer(IDatabase db, ILogger<EventConsumer> logger)
+    {
+        _db = db;
+        _logger = logger;
+
+        // 🧠 Step 1: Connect to RabbitMQ
+        var factory = new ConnectionFactory
+        {
+            HostName = "localhost",  // Replace with your host
+            DispatchConsumersAsync = true
+        };
+
+        _connection = factory.CreateConnection();
+        _channel = _connection.CreateModel();
+
+        // Ensure the queue exists
+        _channel.QueueDeclare(queue: _queueName, durable: true, exclusive: false, autoDelete: false);
+    }
+
+    public void StartConsuming()
+    {
+        // 🧩 Step 2: Create a consumer to listen on the queue
+        var consumer = new AsyncEventingBasicConsumer(_channel);
+        consumer.Received += async (model, ea) =>
+        {
+            var body = ea.Body.ToArray();
+            var message = Encoding.UTF8.GetString(body);
+            var evt = JsonSerializer.Deserialize<EventMessage>(message);
+            string eventId = evt.EventId;
+
+            try
+            {
+                // 🔍 Step 3: Deduplication check in DB
+                bool alreadyProcessed = await _db.Events.AnyAsync(e => e.EventId == eventId && e.IsCompleted);
+
+                if (alreadyProcessed)
+                {
+                    _logger.LogInformation($"Duplicate event {eventId} detected. Skipping...");
+                    _channel.BasicAck(ea.DeliveryTag, false);
+                    return;
+                }
+
+                // 🧱 Step 4: Claim event record
+                var record = new EventRecord
+                {
+                    EventId = eventId,
+                    Payload = evt.Payload,
+                    IsCompleted = false,
+                    ProcessedAt = DateTime.UtcNow
+                };
+
+                await _db.Events.AddAsync(record);
+                await _db.SaveChangesAsync();
+
+                // ⚙️ Step 5: Process event
+                await ProcessEventAsync(evt);
+
+                // ✅ Step 6: Mark as completed
+                record.IsCompleted = true;
+                await _db.SaveChangesAsync();
+
+                // 📬 Step 7: Acknowledge message
+                _channel.BasicAck(ea.DeliveryTag, false);
+                _logger.LogInformation($"Event {eventId} processed successfully.");
+            }
+            catch (DbUpdateException dbEx) when (dbEx.Message.Contains("duplicate"))
+            {
+                // Race condition handled by DB constraint
+                _logger.LogWarning($"Concurrent duplicate insert detected for {eventId}.");
+                _channel.BasicAck(ea.DeliveryTag, false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error processing event {eventId}. Requeuing...");
+                _channel.BasicNack(ea.DeliveryTag, false, true); // Requeue for retry
+            }
+        };
+
+        // 🌀 Step 8: Start consuming messages
+        _channel.BasicConsume(queue: _queueName, autoAck: false, consumer: consumer);
+        _logger.LogInformation("Consumer started and listening for events...");
+    }
+
+  }
